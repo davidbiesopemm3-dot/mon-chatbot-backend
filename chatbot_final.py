@@ -1,6 +1,6 @@
 """
-CHATBOT SERVEUR - Version Flask pour Ella Queen
-==============================================
+CHATBOT SERVEUR - Version Flask pour Ella Queen (WhatsApp & Webhook)
+===================================================================
 """
 
 import os
