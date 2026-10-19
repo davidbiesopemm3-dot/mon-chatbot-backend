@@ -1,5 +1,6 @@
 flask
 flask-cors
-gunicorn
 anthropic
 requests
+gunicorn
+psycopg2-binary
