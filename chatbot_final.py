@@ -104,9 +104,13 @@ Prise de commande, dans cet ordre :
    - Orange Money ou Wave : indique le montant total et le numéro de paiement, puis demande-lui
      d'envoyer ici la capture d'écran du paiement. C'est obligatoire.
    - Espèces : dis-lui qu'elle paiera le livreur à la réception.
+   - Si enregistrer_commande indique capture_deja_recue, ne redemande pas la capture :
+     dis simplement qu'une conseillère vérifie le paiement.
 Si enregistrer_commande renvoie une erreur (taille ou stock indisponible, commune inconnue),
 explique-le simplement à la cliente et propose une solution.
 Ne confirme jamais toi-même qu'un paiement est reçu : c'est une conseillère qui vérifie.
+Si la cliente envoie une image alors qu'aucune commande n'est enregistrée, remercie-la et
+continue normalement la prise de commande (l'image sera rattachée automatiquement à sa commande).
 
 Passer la main à une conseillère (outil passer_a_un_humain) :
 - si la cliente demande à parler à une personne,
@@ -469,10 +473,26 @@ def outil_enregistrer_commande(ctx, articles, nom, commune, adresse, telephone, 
     ticket = obtenir_ticket(ctx["numero"])
     suite = ("Paiement en espèces à la livraison." if mode_paiement == "cash"
              else f"En attente de la capture de paiement. Quand elle arrive et que c'est bon : #{ticket} ok")
-    envoyer_au_proprio(f"Nouvelle commande n°{commande['id']} - cliente #{ticket} (+{ctx['numero']})\n\n"
-                       f"{recap}\n\n{suite}", ctx["numero"])
+    # La cliente avait peut-être envoyé sa capture AVANT de commander : on la rattache
+    orphelines = []
+    if mode_paiement != "cash":
+        orphelines = requete_sql(
+            "update public.captures_paiement set commande_id = %s "
+            "where numero_whatsapp = %s and commande_id is null and created_at > now() - interval '24 hours' "
+            "returning type_mime, nom_fichier, contenu, created_at",
+            (commande["id"], ctx["numero"]),
+        )
+    if orphelines:
+        changer_statut_commande(commande["id"], "paiement_a_verifier")
+        commande["statut"] = "paiement_a_verifier"
+        for cap in orphelines:
+            envoyer_capture_au_proprio(commande, ticket, ctx["numero"], bytes(cap["contenu"]),
+                                       cap["type_mime"], cap["nom_fichier"], cap["created_at"])
+    else:
+        envoyer_au_proprio(f"Nouvelle commande n°{commande['id']} - cliente #{ticket} (+{ctx['numero']})\n\n"
+                           f"{recap}\n\n{suite}", ctx["numero"])
     return {"ok": True, "commande_id": commande["id"], "total": formater_prix(total),
-            "recapitulatif_deja_envoye": True}
+            "recapitulatif_deja_envoye": True, "capture_deja_recue": bool(orphelines)}
 
 
 def executer_outil(nom, entree, ctx):
@@ -511,12 +531,35 @@ def executer_outil(nom, entree, ctx):
         return {"ok": False, "raison": "Erreur technique."}
 
 
+def etat_commande_cliente(numero):
+    """Une phrase sur la commande en cours de la cliente, ajoutée aux consignes de Claude."""
+    try:
+        commande = derniere_commande(numero)
+    except Exception:
+        return ""
+    if not commande or datetime.now(timezone.utc) - commande["created_at"] > timedelta(days=7):
+        return ""
+    n, total = commande["id"], formater_prix(commande["total"])
+    etats = {
+        "en_attente_paiement": f"La commande n°{n} ({total}) est enregistrée et attend la capture de paiement.",
+        "paiement_a_verifier": (f"La commande n°{n} ({total}) : la capture de paiement est reçue, une conseillère "
+                                "la vérifie. Si la cliente demande, dis que la vérification est en cours, "
+                                "sans confirmer le paiement toi-même."),
+        "a_payer_livraison": f"La commande n°{n} ({total}) est confirmée, paiement en espèces à la livraison.",
+        "payee": f"La commande n°{n} ({total}) est payée et confirmée, livraison {commande['jour_livraison']}.",
+        "annulee": f"La commande n°{n} a été annulée.",
+    }
+    texte = etats.get(commande["statut"], "")
+    return f"\n\nÉtat actuel de la cliente : {texte}" if texte else ""
+
+
 def generer_reponse_claude(historique, ctx, outils):
     """Envoie la conversation à Claude, qui peut utiliser les outils avant de répondre."""
     messages = list(historique)
+    consignes = INSTRUCTIONS_SYSTEME + (etat_commande_cliente(ctx["numero"]) if ctx["numero"] != "site" else "")
     for _ in range(8):
         reponse = client.messages.create(
-            model=MODELE, max_tokens=700, system=INSTRUCTIONS_SYSTEME, tools=outils, messages=messages,
+            model=MODELE, max_tokens=700, system=consignes, tools=outils, messages=messages,
         )
         if reponse.stop_reason != "tool_use":
             return "".join(b.text for b in reponse.content if b.type == "text")
@@ -874,116 +917,116 @@ def traiter_message_client(numero, texte):
         ajouter_historique(conv, "user", texte)
         sauver_conversation(conv, activite=True)
 
-        # Une conseillère a la main : on lui transmet le message, le bot se tait
+        # Une conseillère a la main (situation délicate) : on lui transmet le message, le bot se tait
         if conv["mode"] == "humain":
             envoyer_au_proprio(f"#{conv['ticket']} (+{numero}) : {texte}", numero)
             return
 
-        def envoyer_photo(url, legende):
-            ok, _ = envoyer_image_whatsapp(numero, url, legende)
-            return ok
-
-        def envoyer_texte(message):
-            envoyer_message_whatsapp(numero, message)
-            ajouter_historique(conv, "assistant", message)
-
-        ctx = {"numero": numero, "photos": 0, "passer_la_main": None,
-               "envoyer_photo": envoyer_photo, "envoyer_texte": envoyer_texte}
-
-        try:
-            reponse = nettoyer_texte(generer_reponse_claude(list(conv["historique"]), ctx, OUTILS_WHATSAPP))
-        except Exception as e:
-            print(f"Erreur Claude : {e}")
-            reponse = "Désolée, petit souci technique. Une conseillère va vous recontacter très vite."
-            ctx["passer_la_main"] = "Erreur technique du bot"
-
-        if reponse:
-            envoyer_message_whatsapp(numero, reponse)
-            ajouter_historique(conv, "assistant", reponse)
-        sauver_conversation(conv)
-
-        if ctx["passer_la_main"]:
-            passer_la_main(conv, ctx["passer_la_main"], prevenir_client=False)
+        repondre_avec_claude(conv, numero)
 
 
-def traiter_media_client(numero, type_media, media):
-    """La cliente envoie une image ou un document : capture de paiement, ou autre chose."""
-    with verrou_cliente(numero):
-        conv = charger_conversation(numero)
-        ticket = conv["ticket"]
-        ajouter_historique(conv, "user", "(La cliente a envoyé une image)")
-        conv["mode"] = "humain"
+def repondre_avec_claude(conv, numero):
+    """Le bot répond à la cliente (à appeler avec le verrou de la cliente)."""
+    def envoyer_photo(url, legende):
+        ok, _ = envoyer_image_whatsapp(numero, url, legende)
+        return ok
 
-        commande = None
-        try:
-            commande = derniere_commande(numero)
-        except Exception as e:
-            print(f"Erreur lecture commande : {e}")
+    def envoyer_texte(message):
+        envoyer_message_whatsapp(numero, message)
+        ajouter_historique(conv, "assistant", message)
 
-        # Une capture se rattache à la commande en attente (y compris si la cliente la renvoie)
-        est_capture = bool(commande and commande["statut"] in ("en_attente_paiement", "paiement_a_verifier"))
-        maintenant = heure_abidjan(datetime.now(timezone.utc))
-        if est_capture:
-            changer_statut_commande(commande["id"], "paiement_a_verifier")
-            message_cliente = ("Merci, nous avons bien reçu votre capture. "
-                               "Nous vérifions le paiement et revenons vers vous très vite.")
-            legende = f"Paiement commande n°{commande['id']} - cliente #{ticket}"
-            fiche = (f"Capture reçue le {maintenant}\n"
-                     f"Total attendu : {formater_prix(commande['total'])}\n\n"
-                     f"{construire_recapitulatif(commande)}\n\n"
-                     f"WhatsApp de la cliente : +{numero}\n\n"
-                     f"Si le paiement est bon : #{ticket} ok\n"
-                     f"Sinon : #{ticket} suivi de ton message")
-        else:
-            message_cliente = "Merci, je transmets votre image à une conseillère, elle vous répond très vite."
-            legende = f"Image reçue de la cliente #{ticket}"
-            fiche = (f"Image reçue le {maintenant}\n"
-                     f"WhatsApp de la cliente : +{numero}\n"
-                     "Aucune commande en attente de paiement pour cette cliente.\n")
-            if commande:
-                fiche += (f"\nSa dernière commande ({LIBELLES_STATUT.get(commande['statut'], commande['statut'])}) :\n"
-                          f"{construire_recapitulatif(commande)}\n")
-            historique_avant = [m for m in conv["historique"] if m["content"] != "(La cliente a envoyé une image)"]
-            if historique_avant:
-                try:
-                    fiche += f"\nRésumé de la conversation : {resumer_conversation(historique_avant)}\n"
-                except Exception as e:
-                    print(f"Erreur résumé : {e}")
-            fiche += (f"\nPour lui répondre : #{ticket} suivi de ton message\n"
-                      f"Pour rendre la main au bot : #{ticket} bot")
-
-        envoyer_message_whatsapp(numero, message_cliente)
-        ajouter_historique(conv, "assistant", message_cliente)
-        sauver_conversation(conv, activite=True)
+    ctx = {"numero": numero, "photos": 0, "passer_la_main": None,
+           "envoyer_photo": envoyer_photo, "envoyer_texte": envoyer_texte}
 
     try:
-        fichier, type_mime = telecharger_media(media["id"])
+        reponse = nettoyer_texte(generer_reponse_claude(list(conv["historique"]), ctx, OUTILS_WHATSAPP))
     except Exception as e:
-        print(f"Erreur téléchargement image : {e}")
-        envoyer_au_proprio(f"{legende}\n(L'image n'a pas pu être récupérée, demande-la à la cliente.)\n\n{fiche}", numero)
-        return
+        print(f"Erreur Claude : {e}")
+        reponse = "Désolée, petit souci technique. Une conseillère va vous recontacter très vite."
+        ctx["passer_la_main"] = "Erreur technique du bot"
 
-    if est_capture:
-        nom_fichier = media.get("filename") or f"capture-commande-{commande['id']}.jpg"
-    else:
-        nom_fichier = media.get("filename") or "image.jpg"
+    if reponse:
+        envoyer_message_whatsapp(numero, reponse)
+        ajouter_historique(conv, "assistant", reponse)
+    sauver_conversation(conv)
 
-    # 1. On garde la capture dans Supabase : elle ne peut plus se perdre
-    try:
-        enregistrer_capture(commande["id"] if est_capture else None, numero, type_mime, nom_fichier, fichier)
-    except Exception as e:
-        print(f"Erreur enregistrement capture : {e}")
+    if ctx["passer_la_main"]:
+        passer_la_main(conv, ctx["passer_la_main"], prevenir_client=False)
 
-    # 2. On la transfère au propriétaire (ou en file d'attente si sa fenêtre de 24 h est fermée)
+
+def envoyer_capture_au_proprio(commande, ticket, numero, fichier, type_mime, nom_fichier, moment):
+    """Envoie au propriétaire la capture, puis juste en dessous toutes les infos de la cliente."""
+    legende = f"Paiement commande n°{commande['id']} - cliente #{ticket}"
+    fiche = (f"Capture reçue le {heure_abidjan(moment)}\n"
+             f"Total attendu : {formater_prix(commande['total'])}\n\n"
+             f"{construire_recapitulatif(commande)}\n\n"
+             f"WhatsApp de la cliente : +{numero}\n\n"
+             f"Si le paiement est bon : #{ticket} ok\n"
+             f"Sinon : #{ticket} suivi de ton message")
     try:
         id_media = televerser_media(fichier, type_mime, nom_fichier)
         envoyer_au_proprio(contenu_media(type_mime, id_media, legende, nom_fichier), numero)
     except Exception as e:
         print(f"Erreur transfert image : {e}")
-        legende += "\n(L'image est enregistrée : écris \"commande N\" pour la recevoir.)"
-        envoyer_au_proprio(legende, numero)
-    # 3. Juste sous l'image : toutes les infos de la cliente
+        envoyer_au_proprio(legende + "\n(L'image est enregistrée : écris \"commande N\" pour la recevoir.)", numero)
     envoyer_au_proprio(fiche, numero)
+
+
+def traiter_media_client(numero, type_media, media):
+    """
+    La cliente envoie une image ou un document.
+    - Une commande attend son paiement : c'est la capture. On l'enregistre, on prévient le propriétaire
+      (capture + fiche complète, une seule fois) et le bot continue de répondre à la cliente.
+    - Sinon : on garde l'image (elle sera rattachée à la commande si la cliente commande ensuite)
+      et le bot continue la conversation, sans déranger le propriétaire.
+    """
+    try:
+        fichier, type_mime = telecharger_media(media["id"])
+    except Exception as e:
+        print(f"Erreur téléchargement image : {e}")
+        fichier, type_mime = None, None
+
+    with verrou_cliente(numero):
+        conv = charger_conversation(numero)
+        ticket = conv["ticket"]
+        commande = None
+        try:
+            commande = derniere_commande(numero)
+        except Exception as e:
+            print(f"Erreur lecture commande : {e}")
+        est_capture = bool(commande and commande["statut"] in ("en_attente_paiement", "paiement_a_verifier"))
+
+        nom_fichier = media.get("filename") or (
+            f"capture-commande-{commande['id']}.jpg" if est_capture else "image.jpg")
+        if fichier:
+            try:
+                enregistrer_capture(commande["id"] if est_capture else None, numero, type_mime, nom_fichier, fichier)
+            except Exception as e:
+                print(f"Erreur enregistrement capture : {e}")
+
+        if est_capture:
+            changer_statut_commande(commande["id"], "paiement_a_verifier")
+            message_cliente = ("Merci, nous avons bien reçu votre capture. "
+                               "Nous vérifions le paiement et revenons vers vous très vite.")
+            ajouter_historique(conv, "user", "(La cliente a envoyé la capture de son paiement)")
+            envoyer_message_whatsapp(numero, message_cliente)
+            ajouter_historique(conv, "assistant", message_cliente)
+            sauver_conversation(conv, activite=True)
+        else:
+            ajouter_historique(conv, "user", "(La cliente a envoyé une image. Aucune commande n'est encore enregistrée.)")
+            sauver_conversation(conv, activite=True)
+            if conv["mode"] == "humain":
+                envoyer_au_proprio(f"#{ticket} (+{numero}) a envoyé une image.", numero)
+            else:
+                repondre_avec_claude(conv, numero)
+
+    if est_capture:
+        if fichier:
+            envoyer_capture_au_proprio(commande, ticket, numero, fichier, type_mime, nom_fichier,
+                                       datetime.now(timezone.utc))
+        else:
+            envoyer_au_proprio(f"Paiement commande n°{commande['id']} - cliente #{ticket} : la capture n'a pas pu "
+                               f"être récupérée, demande-la à la cliente avec #{ticket} suivi de ton message.", numero)
 
 
 def traiter_message_entrant(message):
