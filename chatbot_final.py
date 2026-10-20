@@ -1,14 +1,16 @@
 """
 CHATBOT SERVEUR - Chez Ella (WhatsApp + site web)
 ===================================================================
-Version 4 :
+Version 5 :
 - Catalogue lu dans Supabase (table "produits"), envoi des photos
 - Prise de commande complète, frais de livraison par commune, récapitulatif
 - Paiement Orange Money / Wave : capture transférée au propriétaire, qui confirme avec "#N ok"
 - Passage de relais au propriétaire sur événement (capture, demande d'un humain, question sans réponse)
 - Toute la mémoire (conversations, tickets, messages en attente) est rangée dans Supabase :
   rien ne se perd quand Render se met en veille ou redémarre
-- Le propriétaire peut demander "commandes" (liste) ou "commande 12" (détail)
+- Le propriétaire peut demander "commandes" (liste) ou "commande 12" (détail + capture)
+- Les captures de paiement sont enregistrées dans Supabase (table "captures_paiement")
+- Les heures (heure d'Abidjan) apparaissent dans les récapitulatifs et la liste
 """
 
 import json
@@ -141,6 +143,11 @@ def formater_prix(prix):
     return f"{int(prix):,}".replace(",", " ") + " FCFA"
 
 
+def heure_abidjan(moment):
+    """Abidjan est à l'heure GMT (UTC+0) toute l'année."""
+    return moment.astimezone(timezone.utc).strftime("%d/%m/%Y à %Hh%M")
+
+
 def normaliser(texte):
     """'Port-Bouët' -> 'portbouet' : pour comparer sans se soucier des accents, espaces et majuscules."""
     texte = unicodedata.normalize("NFD", (texte or "").lower())
@@ -232,7 +239,10 @@ NOMS_PAIEMENT = {"orange_money": "Orange Money", "wave": "Wave", "cash": "Espèc
 
 
 def construire_recapitulatif(commande):
-    texte = f"Récapitulatif de la commande n°{commande['id']}\n\n"
+    texte = f"Récapitulatif de la commande n°{commande['id']}\n"
+    if commande.get("created_at"):
+        texte += f"Passée le {heure_abidjan(commande['created_at'])}\n"
+    texte += "\n"
     for l in commande["articles"]:
         taille = f", taille {l['taille']}" if l.get("taille") else ""
         texte += f"{l['nom']}{taille} x{l['quantite']} : {formater_prix(l['montant'])}\n"
@@ -244,6 +254,21 @@ def construire_recapitulatif(commande):
     texte += f"Jour de livraison : {commande['jour_livraison']}\n"
     texte += f"Paiement : {NOMS_PAIEMENT.get(commande['mode_paiement'], commande['mode_paiement'])}"
     return texte
+
+
+# ---------- Captures de paiement ----------
+def enregistrer_capture(commande_id, numero, type_mime, nom_fichier, contenu):
+    requete_sql(
+        "insert into public.captures_paiement (commande_id, numero_whatsapp, type_mime, nom_fichier, contenu) "
+        "values (%s, %s, %s, %s, %s)",
+        (commande_id, numero, type_mime, nom_fichier, psycopg2.Binary(contenu)),
+    )
+
+
+def captures_de_commande(commande_id):
+    return requete_sql(
+        "select type_mime, nom_fichier, contenu, created_at from public.captures_paiement "
+        "where commande_id = %s order by id", (commande_id,))
 
 
 # ---------- Clientes (mémoire des conversations) ----------
@@ -575,20 +600,34 @@ def envoyer_image_whatsapp(numero, url_image, legende=""):
     return appel_whatsapp(numero, {"type": "image", "image": {"link": url_image, "caption": legende}})
 
 
-def recopier_media(media_id, nom_fichier):
-    """Télécharge une image reçue d'une cliente et la renvoie chez Meta, pour pouvoir la transférer."""
+def telecharger_media(media_id):
+    """Télécharge une image envoyée par une cliente. Renvoie (contenu, type)."""
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
     info = requests.get(f"{GRAPH_BASE}/{media_id}", headers=headers, timeout=15).json()
     fichier = requests.get(info["url"], headers=headers, timeout=30)
-    type_mime = info.get("mime_type", "image/jpeg")
+    fichier.raise_for_status()
+    return fichier.content, info.get("mime_type", "image/jpeg")
+
+
+def televerser_media(contenu, type_mime, nom_fichier):
+    """Envoie un fichier chez Meta pour pouvoir le transférer sur WhatsApp. Renvoie son identifiant."""
     envoi = requests.post(
         f"{GRAPH_BASE}/{PHONE_NUMBER_ID}/media",
-        headers=headers,
+        headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
         data={"messaging_product": "whatsapp", "type": type_mime},
-        files={"file": (nom_fichier, fichier.content, type_mime)},
+        files={"file": (nom_fichier, contenu, type_mime)},
         timeout=30,
     )
     return envoi.json()["id"]
+
+
+def contenu_media(type_mime, id_media, legende, nom_fichier):
+    """Prépare un message image (ou document pour un PDF) à partir d'un identifiant Meta."""
+    type_media = "image" if type_mime.startswith("image/") else "document"
+    contenu = {"type": type_media, type_media: {"id": id_media, "caption": legende}}
+    if type_media == "document":
+        contenu["document"]["filename"] = nom_fichier
+    return contenu
 
 
 # ============================================
@@ -660,7 +699,9 @@ LIBELLES_STATUT = {
 
 def liste_commandes_en_cours():
     commandes = requete_sql(
-        "select c.*, cl.ticket from public.commandes c "
+        "select c.*, cl.ticket, "
+        "(select count(*) from public.captures_paiement cp where cp.commande_id = c.id) as nb_captures "
+        "from public.commandes c "
         "left join public.clientes cl on cl.numero_whatsapp = c.numero_whatsapp "
         "where c.statut in ('paiement_a_verifier', 'en_attente_paiement', 'a_payer_livraison') "
         "order by (c.statut = 'paiement_a_verifier') desc, c.id desc limit 15"
@@ -674,19 +715,22 @@ def liste_commandes_en_cours():
     for c in commandes:
         ticket = c["ticket"] or obtenir_ticket(c["numero_whatsapp"])
         texte += (f"\nCommande n°{c['id']} - cliente #{ticket} ({c['nom']})\n"
-                  f"{formater_prix(c['total'])} - {c['commune']}, {c['jour_livraison']}\n"
+                  f"Passée le {heure_abidjan(c['created_at'])}\n"
+                  f"{formater_prix(c['total'])} - {c['commune']}, livraison {c['jour_livraison']}\n"
                   f"Statut : {LIBELLES_STATUT.get(c['statut'], c['statut'])}\n")
+        if c["mode_paiement"] != "cash":
+            texte += f"Capture : {'oui' if c['nb_captures'] else 'non'}\n"
         if c["statut"] == "paiement_a_verifier":
             texte += f"Si le paiement est bon : #{ticket} ok\n"
     texte += f"\nCommandes payées ces 7 derniers jours : {payees}\n"
-    texte += "Détail d'une commande : commande 12"
+    texte += "Détail et capture d'une commande : commande 12"
     return texte
 
 
 AIDE_PROPRIETAIRE = (
     "Ce que tu peux m'écrire :\n"
     "commandes : la liste des commandes en cours\n"
-    "commande 12 : le détail de la commande n°12\n"
+    "commande 12 : le détail de la commande n°12, avec la capture du paiement\n"
     "#3 suivi de ton message : je le transmets à la cliente n°3\n"
     "#3 ok : paiement vérifié, la commande est confirmée\n"
     "#3 annule : la commande est annulée\n"
@@ -711,6 +755,20 @@ def traiter_message_proprietaire(texte, id_message_cite):
             NUMERO_PROPRIETAIRE,
             f"{construire_recapitulatif(commande)}\n\nCliente #{ticket} (+{commande['numero_whatsapp']})\n"
             f"Statut : {LIBELLES_STATUT.get(commande['statut'], commande['statut'])}")
+        captures = captures_de_commande(commande["id"])
+        if not captures and commande["mode_paiement"] != "cash":
+            envoyer_message_whatsapp(NUMERO_PROPRIETAIRE,
+                                     f"Aucune capture de paiement enregistrée pour la commande n°{commande['id']}. "
+                                     f"Pour la demander : #{ticket} Pouvez-vous renvoyer la capture de votre paiement ?")
+        for cap in captures:
+            try:
+                id_media = televerser_media(bytes(cap["contenu"]), cap["type_mime"], cap["nom_fichier"])
+                legende = f"Capture commande n°{commande['id']} reçue le {heure_abidjan(cap['created_at'])}"
+                appel_whatsapp(NUMERO_PROPRIETAIRE,
+                               contenu_media(cap["type_mime"], id_media, legende, cap["nom_fichier"]))
+            except Exception as e:
+                print(f"Erreur envoi capture : {e}")
+                envoyer_message_whatsapp(NUMERO_PROPRIETAIRE, "La capture n'a pas pu être envoyée, réessaie plus tard.")
         return
 
     # ---- Retrouver la cliente concernée ----
@@ -857,7 +915,9 @@ def traiter_media_client(numero, type_media, media):
         except Exception as e:
             print(f"Erreur lecture commande : {e}")
 
-        if commande and commande["statut"] == "en_attente_paiement":
+        # Une capture se rattache à la commande en attente (y compris si la cliente la renvoie)
+        est_capture = bool(commande and commande["statut"] in ("en_attente_paiement", "paiement_a_verifier"))
+        if est_capture:
             changer_statut_commande(commande["id"], "paiement_a_verifier")
             message_cliente = ("Merci, nous avons bien reçu votre capture. "
                                "Nous vérifions le paiement et revenons vers vous très vite.")
@@ -875,16 +935,31 @@ def traiter_media_client(numero, type_media, media):
         ajouter_historique(conv, "assistant", message_cliente)
         sauver_conversation(conv, activite=True)
 
-    nom_fichier = media.get("filename") or ("capture.jpg" if type_media == "image" else "document")
     try:
-        nouvel_id = recopier_media(media["id"], nom_fichier)
-        contenu = {"type": type_media, type_media: {"id": nouvel_id, "caption": legende}}
-        if type_media == "document":
-            contenu["document"]["filename"] = nom_fichier
-        envoyer_au_proprio(contenu, numero)
+        fichier, type_mime = telecharger_media(media["id"])
+    except Exception as e:
+        print(f"Erreur téléchargement image : {e}")
+        envoyer_au_proprio(legende + "\n(L'image n'a pas pu être récupérée, demande-la à la cliente.)", numero)
+        return
+
+    if est_capture:
+        nom_fichier = media.get("filename") or f"capture-commande-{commande['id']}.jpg"
+    else:
+        nom_fichier = media.get("filename") or "image.jpg"
+
+    # 1. On garde la capture dans Supabase : elle ne peut plus se perdre
+    try:
+        enregistrer_capture(commande["id"] if est_capture else None, numero, type_mime, nom_fichier, fichier)
+    except Exception as e:
+        print(f"Erreur enregistrement capture : {e}")
+
+    # 2. On la transfère au propriétaire (ou en file d'attente si sa fenêtre de 24 h est fermée)
+    try:
+        id_media = televerser_media(fichier, type_mime, nom_fichier)
+        envoyer_au_proprio(contenu_media(type_mime, id_media, legende, nom_fichier), numero)
     except Exception as e:
         print(f"Erreur transfert image : {e}")
-        envoyer_au_proprio(legende + "\n(L'image n'a pas pu être transférée, demande-la à la cliente.)", numero)
+        envoyer_au_proprio(legende + "\n(L'image est enregistrée : écris \"commande N\" pour la recevoir.)", numero)
 
 
 def traiter_message_entrant(message):
@@ -918,7 +993,7 @@ def traiter_message_entrant(message):
 # ============================================
 @app.route("/")
 def home():
-    return "Le serveur du chatbot Chez Ella est en ligne ! (version 4)"
+    return "Le serveur du chatbot Chez Ella est en ligne ! (version 5)"
 
 
 @app.route("/message", methods=["POST"])
