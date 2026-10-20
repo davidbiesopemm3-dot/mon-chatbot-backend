@@ -265,10 +265,12 @@ def enregistrer_capture(commande_id, numero, type_mime, nom_fichier, contenu):
     )
 
 
-def captures_de_commande(commande_id):
-    return requete_sql(
+def captures_de_commande(commande_id, maximum=3):
+    """Les dernières captures de la commande (3 au plus), de la plus ancienne à la plus récente."""
+    lignes = requete_sql(
         "select type_mime, nom_fichier, contenu, created_at from public.captures_paiement "
-        "where commande_id = %s order by id", (commande_id,))
+        "where commande_id = %s order by id desc limit %s", (commande_id, maximum))
+    return list(reversed(lignes))
 
 
 # ---------- Clientes (mémoire des conversations) ----------
@@ -751,10 +753,6 @@ def traiter_message_proprietaire(texte, id_message_cite):
             envoyer_message_whatsapp(NUMERO_PROPRIETAIRE, f"Je ne trouve pas la commande n°{detail.group(1)}.")
             return
         ticket = obtenir_ticket(commande["numero_whatsapp"])
-        envoyer_message_whatsapp(
-            NUMERO_PROPRIETAIRE,
-            f"{construire_recapitulatif(commande)}\n\nCliente #{ticket} (+{commande['numero_whatsapp']})\n"
-            f"Statut : {LIBELLES_STATUT.get(commande['statut'], commande['statut'])}")
         captures = captures_de_commande(commande["id"])
         if not captures and commande["mode_paiement"] != "cash":
             envoyer_message_whatsapp(NUMERO_PROPRIETAIRE,
@@ -769,6 +767,13 @@ def traiter_message_proprietaire(texte, id_message_cite):
             except Exception as e:
                 print(f"Erreur envoi capture : {e}")
                 envoyer_message_whatsapp(NUMERO_PROPRIETAIRE, "La capture n'a pas pu être envoyée, réessaie plus tard.")
+        # Les infos complètes, juste sous la capture
+        suite = f"Si le paiement est bon : #{ticket} ok\n" if commande["statut"] == "paiement_a_verifier" else ""
+        envoyer_message_whatsapp(
+            NUMERO_PROPRIETAIRE,
+            f"{construire_recapitulatif(commande)}\n\n"
+            f"Cliente #{ticket} - WhatsApp : +{commande['numero_whatsapp']}\n"
+            f"Statut : {LIBELLES_STATUT.get(commande['statut'], commande['statut'])}\n{suite}".strip())
         return
 
     # ---- Retrouver la cliente concernée ----
@@ -917,19 +922,35 @@ def traiter_media_client(numero, type_media, media):
 
         # Une capture se rattache à la commande en attente (y compris si la cliente la renvoie)
         est_capture = bool(commande and commande["statut"] in ("en_attente_paiement", "paiement_a_verifier"))
+        maintenant = heure_abidjan(datetime.now(timezone.utc))
         if est_capture:
             changer_statut_commande(commande["id"], "paiement_a_verifier")
             message_cliente = ("Merci, nous avons bien reçu votre capture. "
                                "Nous vérifions le paiement et revenons vers vous très vite.")
-            legende = (f"Paiement commande n°{commande['id']} - cliente #{ticket} (+{numero})\n"
-                       f"Total attendu : {formater_prix(commande['total'])}\n"
-                       f"Si le paiement est bon : #{ticket} ok\n"
-                       f"Sinon : #{ticket} suivi de ton message")
+            legende = f"Paiement commande n°{commande['id']} - cliente #{ticket}"
+            fiche = (f"Capture reçue le {maintenant}\n"
+                     f"Total attendu : {formater_prix(commande['total'])}\n\n"
+                     f"{construire_recapitulatif(commande)}\n\n"
+                     f"WhatsApp de la cliente : +{numero}\n\n"
+                     f"Si le paiement est bon : #{ticket} ok\n"
+                     f"Sinon : #{ticket} suivi de ton message")
         else:
             message_cliente = "Merci, je transmets votre image à une conseillère, elle vous répond très vite."
-            legende = (f"Image reçue de la cliente #{ticket} (+{numero})\n"
-                       f"Pour lui répondre : #{ticket} suivi de ton message\n"
-                       f"Pour rendre la main au bot : #{ticket} bot")
+            legende = f"Image reçue de la cliente #{ticket}"
+            fiche = (f"Image reçue le {maintenant}\n"
+                     f"WhatsApp de la cliente : +{numero}\n"
+                     "Aucune commande en attente de paiement pour cette cliente.\n")
+            if commande:
+                fiche += (f"\nSa dernière commande ({LIBELLES_STATUT.get(commande['statut'], commande['statut'])}) :\n"
+                          f"{construire_recapitulatif(commande)}\n")
+            historique_avant = [m for m in conv["historique"] if m["content"] != "(La cliente a envoyé une image)"]
+            if historique_avant:
+                try:
+                    fiche += f"\nRésumé de la conversation : {resumer_conversation(historique_avant)}\n"
+                except Exception as e:
+                    print(f"Erreur résumé : {e}")
+            fiche += (f"\nPour lui répondre : #{ticket} suivi de ton message\n"
+                      f"Pour rendre la main au bot : #{ticket} bot")
 
         envoyer_message_whatsapp(numero, message_cliente)
         ajouter_historique(conv, "assistant", message_cliente)
@@ -939,7 +960,7 @@ def traiter_media_client(numero, type_media, media):
         fichier, type_mime = telecharger_media(media["id"])
     except Exception as e:
         print(f"Erreur téléchargement image : {e}")
-        envoyer_au_proprio(legende + "\n(L'image n'a pas pu être récupérée, demande-la à la cliente.)", numero)
+        envoyer_au_proprio(f"{legende}\n(L'image n'a pas pu être récupérée, demande-la à la cliente.)\n\n{fiche}", numero)
         return
 
     if est_capture:
@@ -959,7 +980,10 @@ def traiter_media_client(numero, type_media, media):
         envoyer_au_proprio(contenu_media(type_mime, id_media, legende, nom_fichier), numero)
     except Exception as e:
         print(f"Erreur transfert image : {e}")
-        envoyer_au_proprio(legende + "\n(L'image est enregistrée : écris \"commande N\" pour la recevoir.)", numero)
+        legende += "\n(L'image est enregistrée : écris \"commande N\" pour la recevoir.)"
+        envoyer_au_proprio(legende, numero)
+    # 3. Juste sous l'image : toutes les infos de la cliente
+    envoyer_au_proprio(fiche, numero)
 
 
 def traiter_message_entrant(message):
