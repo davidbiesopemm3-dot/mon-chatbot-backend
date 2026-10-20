@@ -1,15 +1,14 @@
 """
 CHATBOT SERVEUR - Chez Ella (WhatsApp + site web)
 ===================================================================
-Version 3 :
+Version 4 :
 - Catalogue lu dans Supabase (table "produits"), envoi des photos
-- Prise de commande complète : nom, commune + adresse, téléphone, jour de livraison,
-  frais de livraison selon la commune (table "zones_livraison"), récapitulatif
-- Paiement Orange Money / Wave : le bot demande la capture d'écran et la transfère
-  au propriétaire, qui confirme avec "#N ok"
-- Le bot passe la main au propriétaire sur événement :
-  capture de paiement, demande d'un humain, question sans réponse
-- Réponses en texte simple : pas d'émojis, pas d'astérisques, un seul bonjour
+- Prise de commande complète, frais de livraison par commune, récapitulatif
+- Paiement Orange Money / Wave : capture transférée au propriétaire, qui confirme avec "#N ok"
+- Passage de relais au propriétaire sur événement (capture, demande d'un humain, question sans réponse)
+- Toute la mémoire (conversations, tickets, messages en attente) est rangée dans Supabase :
+  rien ne se perd quand Render se met en veille ou redémarre
+- Le propriétaire peut demander "commandes" (liste) ou "commande 12" (détail)
 """
 
 import json
@@ -17,7 +16,7 @@ import os
 import re
 import threading
 import unicodedata
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import anthropic
 import psycopg2
@@ -42,7 +41,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 # Numéro WhatsApp perso du propriétaire, avec indicatif, sans le + (ex : 33612345678)
 NUMERO_PROPRIETAIRE = os.environ.get("NUMERO_PROPRIETAIRE", "").replace("+", "").replace(" ", "")
 
-# Numéros de paiement de la boutique
+# Numéros de paiement de la boutique (affichés aux clientes)
 PAIEMENT_ORANGE_MONEY = os.environ.get("PAIEMENT_ORANGE_MONEY", "")
 PAIEMENT_WAVE = os.environ.get("PAIEMENT_WAVE", "")
 
@@ -96,8 +95,9 @@ Prise de commande, dans cet ordre :
 2. Demande-lui en UN SEUL message : son nom, sa commune et son adresse de livraison,
    un numéro à appeler pour le livreur, et le jour de livraison souhaité.
 3. Demande comment elle veut payer : Orange Money, Wave, ou espèces à la livraison.
-4. Quand tu as toutes les informations, appelle enregistrer_commande. Le récapitulatif complet
-   est envoyé automatiquement à la cliente : ne le réécris pas.
+4. Quand tu as toutes les informations, appelle OBLIGATOIREMENT enregistrer_commande.
+   Sans cet appel, la commande n'existe pas et la boutique n'est pas prévenue.
+   Le récapitulatif complet est envoyé automatiquement à la cliente : ne le réécris pas.
 5. Juste après :
    - Orange Money ou Wave : indique le montant total et le numéro de paiement, puis demande-lui
      d'envoyer ici la capture d'écran du paiement. C'est obligatoire.
@@ -142,22 +142,21 @@ def formater_prix(prix):
 
 
 def normaliser(texte):
-    """'Port-Bouët' -> 'portbouet' : pour comparer les communes sans se soucier des accents."""
+    """'Port-Bouët' -> 'portbouet' : pour comparer sans se soucier des accents, espaces et majuscules."""
     texte = unicodedata.normalize("NFD", (texte or "").lower())
     texte = "".join(c for c in texte if unicodedata.category(c) != "Mn")
     return re.sub(r"[^a-z0-9]", "", texte)
 
 
+# ---------- Produits ----------
 def rechercher_produits(categorie=None, couleur=None, taille=None, prix_max=None, mot_cle=None):
     conditions = ["actif = true", "stock > 0"]
     params = []
     if categorie:
-        # "jupes" trouve "jupe"
-        conditions.append("(categorie ilike %s or %s ilike '%%' || categorie || '%%')")
+        conditions.append("(categorie ilike %s or %s ilike '%%' || categorie || '%%')")  # "jupes" trouve "jupe"
         params += [f"%{categorie.strip()}%", categorie.strip()]
     if couleur:
-        # "noire" trouve "noir"
-        conditions.append("(couleur ilike %s or %s ilike '%%' || couleur || '%%')")
+        conditions.append("(couleur ilike %s or %s ilike '%%' || couleur || '%%')")      # "noire" trouve "noir"
         params += [f"%{couleur.strip()}%", couleur.strip()]
     if taille:
         conditions.append("%s = any(tailles)")
@@ -188,8 +187,21 @@ def obtenir_produit(produit_id):
     return lignes[0] if lignes else None
 
 
+def diminuer_stock(articles):
+    for a in articles:
+        requete_sql("update public.produits set stock = greatest(stock - %s, 0) where id = %s",
+                    (a["quantite"], a["produit_id"]))
+
+
+def remettre_stock(articles):
+    for a in articles:
+        requete_sql("update public.produits set stock = stock + %s where id = %s",
+                    (a["quantite"], a["produit_id"]))
+
+
+# ---------- Livraison ----------
 def trouver_zone(commune):
-    """Cherche la commune dans la table zones_livraison (sans tenir compte des accents)."""
+    """Cherche la commune dans zones_livraison (sans tenir compte des accents)."""
     cible = normaliser(commune)
     if not cible:
         return None
@@ -200,11 +212,15 @@ def trouver_zone(commune):
     return None
 
 
+# ---------- Commandes ----------
 def derniere_commande(numero):
     lignes = requete_sql(
-        "select * from public.commandes where numero_whatsapp = %s order by id desc limit 1",
-        (numero,),
-    )
+        "select * from public.commandes where numero_whatsapp = %s order by id desc limit 1", (numero,))
+    return lignes[0] if lignes else None
+
+
+def commande_par_id(commande_id):
+    lignes = requete_sql("select * from public.commandes where id = %s", (int(commande_id),))
     return lignes[0] if lignes else None
 
 
@@ -212,36 +228,88 @@ def changer_statut_commande(commande_id, statut):
     requete_sql("update public.commandes set statut = %s where id = %s", (statut, commande_id))
 
 
-def diminuer_stock(articles):
-    for article in articles:
-        requete_sql(
-            "update public.produits set stock = greatest(stock - %s, 0) where id = %s",
-            (article["quantite"], article["produit_id"]),
-        )
+NOMS_PAIEMENT = {"orange_money": "Orange Money", "wave": "Wave", "cash": "Espèces à la livraison"}
 
 
-def remettre_stock(articles):
-    for article in articles:
-        requete_sql(
-            "update public.produits set stock = stock + %s where id = %s",
-            (article["quantite"], article["produit_id"]),
-        )
-
-
-def construire_recapitulatif(commande_id, lignes, commune, frais, total, nom, adresse, telephone, jour, mode):
-    noms_modes = {"orange_money": "Orange Money", "wave": "Wave", "cash": "Espèces à la livraison"}
-    texte = f"Récapitulatif de votre commande n°{commande_id}\n\n"
-    for l in lignes:
-        taille = f", taille {l['taille']}" if l["taille"] else ""
+def construire_recapitulatif(commande):
+    texte = f"Récapitulatif de la commande n°{commande['id']}\n\n"
+    for l in commande["articles"]:
+        taille = f", taille {l['taille']}" if l.get("taille") else ""
         texte += f"{l['nom']}{taille} x{l['quantite']} : {formater_prix(l['montant'])}\n"
-    texte += f"Livraison {commune} : {formater_prix(frais)}\n"
-    texte += f"Total : {formater_prix(total)}\n\n"
-    texte += f"Nom : {nom}\n"
-    texte += f"Adresse : {commune}, {adresse}\n"
-    texte += f"Téléphone : {telephone}\n"
-    texte += f"Jour de livraison : {jour}\n"
-    texte += f"Paiement : {noms_modes.get(mode, mode)}"
+    texte += f"Livraison {commande['commune']} : {formater_prix(commande['frais_livraison'])}\n"
+    texte += f"Total : {formater_prix(commande['total'])}\n\n"
+    texte += f"Nom : {commande['nom']}\n"
+    texte += f"Adresse : {commande['commune']}, {commande['adresse']}\n"
+    texte += f"Téléphone : {commande['telephone']}\n"
+    texte += f"Jour de livraison : {commande['jour_livraison']}\n"
+    texte += f"Paiement : {NOMS_PAIEMENT.get(commande['mode_paiement'], commande['mode_paiement'])}"
     return texte
+
+
+# ---------- Clientes (mémoire des conversations) ----------
+def creer_cliente_si_besoin(numero):
+    # "where not exists" évite de consommer un numéro de ticket quand la cliente existe déjà
+    requete_sql("insert into public.clientes (numero_whatsapp) select %s "
+                "where not exists (select 1 from public.clientes where numero_whatsapp = %s) "
+                "on conflict (numero_whatsapp) do nothing", (numero, numero))
+
+
+def charger_conversation(numero):
+    """Lit la conversation de la cliente dans Supabase (la crée si besoin)."""
+    creer_cliente_si_besoin(numero)
+    ligne = requete_sql(
+        "select ticket, mode, historique, derniere_activite from public.clientes where numero_whatsapp = %s",
+        (numero,),
+    )[0]
+    conv = {"numero": numero, "ticket": ligne["ticket"], "mode": ligne["mode"],
+            "historique": ligne["historique"] or []}
+    # Après 24 h de silence, on repart d'une conversation neuve
+    if datetime.now(timezone.utc) - ligne["derniere_activite"] > DUREE_CONVERSATION:
+        conv["historique"] = []
+        conv["mode"] = "bot"
+    return conv
+
+
+def sauver_conversation(conv, activite=False):
+    sql = "update public.clientes set historique = %s, mode = %s"
+    if activite:
+        sql += ", derniere_activite = now()"
+    requete_sql(sql + " where numero_whatsapp = %s",
+                (json.dumps(conv["historique"], ensure_ascii=False), conv["mode"], conv["numero"]))
+
+
+def obtenir_ticket(numero):
+    """Chaque cliente a un numéro court et permanent (#1, #2...) pour que le propriétaire lui réponde."""
+    creer_cliente_si_besoin(numero)
+    return requete_sql("select ticket from public.clientes where numero_whatsapp = %s", (numero,))[0]["ticket"]
+
+
+def numero_par_ticket(ticket):
+    lignes = requete_sql("select numero_whatsapp from public.clientes where ticket = %s", (int(ticket),))
+    return lignes[0]["numero_whatsapp"] if lignes else None
+
+
+def ajouter_historique(conv, role, texte):
+    historique = conv["historique"]
+    if historique and historique[-1]["role"] == role:
+        historique[-1]["content"] += "\n" + texte
+    else:
+        historique.append({"role": role, "content": texte})
+    del historique[:-TAILLE_HISTORIQUE]
+    while historique and historique[0]["role"] != "user":
+        historique.pop(0)
+
+
+# Un verrou par cliente : deux messages d'une même cliente sont traités l'un après l'autre
+_verrous = {}
+_verrou_global = threading.Lock()
+
+
+def verrou_cliente(numero):
+    with _verrou_global:
+        if numero not in _verrous:
+            _verrous[numero] = threading.Lock()
+        return _verrous[numero]
 
 
 # ============================================
@@ -286,7 +354,8 @@ OUTIL_COMMANDE = {
     "name": "enregistrer_commande",
     "description": (
         "Enregistre la commande quand la cliente a confirmé ses articles et donné toutes ses informations. "
-        "Envoie automatiquement le récapitulatif à la cliente et prévient la gérante."
+        "Envoie automatiquement le récapitulatif à la cliente et prévient la gérante. "
+        "Obligatoire : sans cet appel, la commande n'existe pas."
     ),
     "input_schema": {
         "type": "object",
@@ -344,10 +413,8 @@ def outil_enregistrer_commande(ctx, articles, nom, commune, adresse, telephone, 
             return {"ok": False, "erreur": f"Il ne reste que {produit['stock']} pièce(s) de {produit['nom']}."}
         montant = produit["prix"] * quantite
         sous_total += montant
-        lignes.append({
-            "produit_id": produit["id"], "nom": produit["nom"], "taille": taille,
-            "quantite": quantite, "prix_unitaire": produit["prix"], "montant": montant,
-        })
+        lignes.append({"produit_id": produit["id"], "nom": produit["nom"], "taille": taille,
+                       "quantite": quantite, "prix_unitaire": produit["prix"], "montant": montant})
 
     zone = trouver_zone(commune)
     if not zone:
@@ -358,29 +425,26 @@ def outil_enregistrer_commande(ctx, articles, nom, commune, adresse, telephone, 
     total = sous_total + frais
     statut = "a_payer_livraison" if mode_paiement == "cash" else "en_attente_paiement"
 
-    commande_id = requete_sql(
+    commande = requete_sql(
         "insert into public.commandes (numero_whatsapp, nom, telephone, commune, adresse, jour_livraison, "
         "mode_paiement, articles, sous_total, frais_livraison, total, statut) "
-        "values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) returning id",
+        "values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) returning *",
         (ctx["numero"], nom, telephone, zone["commune"], adresse, jour_livraison, mode_paiement,
          json.dumps(lignes, ensure_ascii=False), sous_total, frais, total, statut),
-    )[0]["id"]
+    )[0]
 
     if mode_paiement == "cash":
         diminuer_stock(lignes)
 
-    recap = construire_recapitulatif(commande_id, lignes, zone["commune"], frais, total,
-                                     nom, adresse, telephone, jour_livraison, mode_paiement)
+    recap = construire_recapitulatif(commande)
     ctx["envoyer_texte"](recap)
 
-    suite = ("Paiement en espèces à la livraison."
-             if mode_paiement == "cash" else "En attente de la capture de paiement.")
     ticket = obtenir_ticket(ctx["numero"])
-    envoyer_au_proprio(
-        f"Nouvelle commande n°{commande_id} - cliente #{ticket} (+{ctx['numero']})\n\n{recap}\n\n{suite}",
-        ctx["numero"],
-    )
-    return {"ok": True, "commande_id": commande_id, "total": formater_prix(total),
+    suite = ("Paiement en espèces à la livraison." if mode_paiement == "cash"
+             else f"En attente de la capture de paiement. Quand elle arrive et que c'est bon : #{ticket} ok")
+    envoyer_au_proprio(f"Nouvelle commande n°{commande['id']} - cliente #{ticket} (+{ctx['numero']})\n\n"
+                       f"{recap}\n\n{suite}", ctx["numero"])
+    return {"ok": True, "commande_id": commande["id"], "total": formater_prix(total),
             "recapitulatif_deja_envoye": True}
 
 
@@ -435,18 +499,14 @@ def generer_reponse_claude(historique, ctx, outils):
         for bloc in reponse.content:
             if bloc.type == "tool_use":
                 resultat = executer_outil(bloc.name, bloc.input, ctx)
-                resultats.append({
-                    "type": "tool_result", "tool_use_id": bloc.id,
-                    "content": json.dumps(resultat, ensure_ascii=False, default=str),
-                })
+                resultats.append({"type": "tool_result", "tool_use_id": bloc.id,
+                                  "content": json.dumps(resultat, ensure_ascii=False, default=str)})
         messages.append({"role": "user", "content": resultats})
     return "Je vérifie cela et je reviens vers vous très vite."
 
 
 def texte_conversation(historique):
-    return "\n".join(
-        f"{'Cliente' if m['role'] == 'user' else 'Boutique'} : {m['content']}" for m in historique
-    )
+    return "\n".join(f"{'Cliente' if m['role'] == 'user' else 'Boutique'} : {m['content']}" for m in historique)
 
 
 def resumer_conversation(historique):
@@ -508,7 +568,7 @@ def appel_whatsapp(numero, contenu):
 
 
 def envoyer_message_whatsapp(numero, texte):
-    return appel_whatsapp(numero, {"type": "text", "text": {"body": texte}})
+    return appel_whatsapp(numero, {"type": "text", "text": {"body": texte[:4000]}})
 
 
 def envoyer_image_whatsapp(numero, url_image, legende=""):
@@ -516,10 +576,7 @@ def envoyer_image_whatsapp(numero, url_image, legende=""):
 
 
 def recopier_media(media_id, nom_fichier):
-    """
-    Télécharge une image reçue d'une cliente et la renvoie chez Meta,
-    pour obtenir un identifiant qu'on peut transférer au propriétaire.
-    """
+    """Télécharge une image reçue d'une cliente et la renvoie chez Meta, pour pouvoir la transférer."""
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
     info = requests.get(f"{GRAPH_BASE}/{media_id}", headers=headers, timeout=15).json()
     fichier = requests.get(info["url"], headers=headers, timeout=30)
@@ -535,271 +592,288 @@ def recopier_media(media_id, nom_fichier):
 
 
 # ============================================
-# MÉMOIRE DES CONVERSATIONS (en mémoire vive, effacée si Render redémarre)
-# Les commandes, elles, sont enregistrées dans Supabase.
-# ============================================
-verrou = threading.RLock()
-conversations = {}          # numéro cliente -> état de la conversation
-tickets = {}                # numéro de ticket -> numéro cliente
-tickets_par_numero = {}     # numéro cliente -> numéro de ticket
-messages_vers_proprio = {}  # id du message envoyé au propriétaire -> numéro cliente
-file_attente_proprio = []   # messages non délivrés au propriétaire (sa fenêtre de 24 h était fermée)
-messages_traites = set()    # anti-doublon
-compteur_tickets = {"n": 0}
-
-
-def obtenir_conversation(numero):
-    maintenant = datetime.now()
-    conv = conversations.get(numero)
-    if conv is None or maintenant - conv["derniere_activite"] > DUREE_CONVERSATION:
-        conv = {"historique": [], "mode": "bot", "derniere_activite": maintenant}
-        conversations[numero] = conv
-    return conv
-
-
-def obtenir_ticket(numero):
-    """Chaque cliente reçoit un numéro court (#1, #2...) pour que le propriétaire puisse lui répondre."""
-    with verrou:
-        if numero not in tickets_par_numero:
-            compteur_tickets["n"] += 1
-            tickets_par_numero[numero] = compteur_tickets["n"]
-            tickets[compteur_tickets["n"]] = numero
-        return tickets_par_numero[numero]
-
-
-def ajouter_historique(conv, role, texte):
-    historique = conv["historique"]
-    if historique and historique[-1]["role"] == role:
-        historique[-1]["content"] += "\n" + texte
-    else:
-        historique.append({"role": role, "content": texte})
-    del historique[:-TAILLE_HISTORIQUE]
-    while historique and historique[0]["role"] != "user":
-        historique.pop(0)
-
-
-# ============================================
 # MESSAGES AU PROPRIÉTAIRE
 # ============================================
-def envoyer_au_proprio(contenu, numero_client=None):
-    """Texte ou image pour le propriétaire. S'il ne passe pas, on le garde en file d'attente."""
+def envoyer_au_proprio(contenu, numero_client=None, depuis_file=False):
+    """
+    Envoie un texte ou une image au propriétaire.
+    S'il ne passe pas (fenêtre de 24 h fermée), il est rangé dans Supabase jusqu'à ce que le propriétaire écrive.
+    """
     if not NUMERO_PROPRIETAIRE:
         print(f"(Pas de NUMERO_PROPRIETAIRE) Message non transmis : {contenu}")
         return False
     if isinstance(contenu, str):
-        contenu = {"type": "text", "text": {"body": contenu}}
+        contenu = {"type": "text", "text": {"body": contenu[:4000]}}
     ok, id_message = appel_whatsapp(NUMERO_PROPRIETAIRE, contenu)
-    with verrou:
+    try:
         if ok and id_message and numero_client:
-            messages_vers_proprio[id_message] = numero_client
-        if not ok:
-            file_attente_proprio.append((contenu, numero_client))
+            requete_sql("insert into public.messages_proprio (id_message, numero_whatsapp) values (%s, %s) "
+                        "on conflict do nothing", (id_message, numero_client))
+        if not ok and not depuis_file:
+            requete_sql("insert into public.file_attente_proprio (contenu, numero_whatsapp) values (%s, %s)",
+                        (json.dumps(contenu, ensure_ascii=False), numero_client))
             print("Message au propriétaire mis en file d'attente : il doit écrire au bot pour la débloquer.")
+    except Exception as e:
+        print(f"Erreur enregistrement message propriétaire : {e}")
     return ok
 
 
 def vider_file_attente():
-    with verrou:
-        en_attente = list(file_attente_proprio)
-        file_attente_proprio.clear()
-    for contenu, numero_client in en_attente:
-        envoyer_au_proprio(contenu, numero_client)
-    return len(en_attente)
+    """Le propriétaire vient d'écrire : sa fenêtre de 24 h est ouverte, on envoie tout ce qui attendait."""
+    en_attente = requete_sql("select id, contenu, numero_whatsapp from public.file_attente_proprio order by id")
+    envoyes = 0
+    for ligne in en_attente:
+        if envoyer_au_proprio(ligne["contenu"], ligne["numero_whatsapp"], depuis_file=True):
+            requete_sql("delete from public.file_attente_proprio where id = %s", (ligne["id"],))
+            envoyes += 1
+    return envoyes
 
 
-def passer_la_main(numero_client, raison, prevenir_client=True):
-    ticket = obtenir_ticket(numero_client)
-    with verrou:
-        conv = obtenir_conversation(numero_client)
-        conv["mode"] = "humain"
-        historique = list(conv["historique"])
+def passer_la_main(conv, raison, prevenir_client=True):
+    """Le propriétaire reprend la conversation : on lui envoie un résumé."""
+    conv["mode"] = "humain"
+    sauver_conversation(conv)
     try:
-        resume = resumer_conversation(historique)
+        resume = resumer_conversation(conv["historique"])
     except Exception as e:
         print(f"Erreur résumé : {e}")
-        resume = texte_conversation(historique)[-800:]
+        resume = texte_conversation(conv["historique"])[-800:]
     if prevenir_client:
-        envoyer_message_whatsapp(numero_client, "Je transmets votre demande à une conseillère, elle vous répond très vite.")
+        envoyer_message_whatsapp(conv["numero"], "Je transmets votre demande à une conseillère, elle vous répond très vite.")
+    t = conv["ticket"]
     envoyer_au_proprio(
-        f"Cliente #{ticket} (+{numero_client})\nRaison : {raison}\n\n{resume}\n\n"
-        f"Pour lui répondre : réponds à ce message, ou commence par #{ticket}.\n"
-        f"Pour rendre la main au bot : #{ticket} bot",
-        numero_client,
+        f"Cliente #{t} (+{conv['numero']})\nRaison : {raison}\n\n{resume}\n\n"
+        f"Pour lui répondre : réponds à ce message, ou commence par #{t}.\n"
+        f"Pour rendre la main au bot : #{t} bot",
+        conv["numero"],
     )
 
 
+LIBELLES_STATUT = {
+    "en_attente_paiement": "en attente de la capture de paiement",
+    "paiement_a_verifier": "CAPTURE REÇUE, à vérifier",
+    "a_payer_livraison": "espèces à la livraison",
+    "payee": "payée",
+    "annulee": "annulée",
+}
+
+
+def liste_commandes_en_cours():
+    commandes = requete_sql(
+        "select c.*, cl.ticket from public.commandes c "
+        "left join public.clientes cl on cl.numero_whatsapp = c.numero_whatsapp "
+        "where c.statut in ('paiement_a_verifier', 'en_attente_paiement', 'a_payer_livraison') "
+        "order by (c.statut = 'paiement_a_verifier') desc, c.id desc limit 15"
+    )
+    payees = requete_sql("select count(*) as n from public.commandes where statut = 'payee' "
+                         "and created_at > now() - interval '7 days'")[0]["n"]
+    if not commandes:
+        return f"Aucune commande en cours.\nCommandes payées ces 7 derniers jours : {payees}"
+
+    texte = f"Commandes en cours ({len(commandes)}) :\n"
+    for c in commandes:
+        ticket = c["ticket"] or obtenir_ticket(c["numero_whatsapp"])
+        texte += (f"\nCommande n°{c['id']} - cliente #{ticket} ({c['nom']})\n"
+                  f"{formater_prix(c['total'])} - {c['commune']}, {c['jour_livraison']}\n"
+                  f"Statut : {LIBELLES_STATUT.get(c['statut'], c['statut'])}\n")
+        if c["statut"] == "paiement_a_verifier":
+            texte += f"Si le paiement est bon : #{ticket} ok\n"
+    texte += f"\nCommandes payées ces 7 derniers jours : {payees}\n"
+    texte += "Détail d'une commande : commande 12"
+    return texte
+
+
 AIDE_PROPRIETAIRE = (
-    "Commandes :\n"
-    "#3 suivi de ton message : le bot le transmet à la cliente n°3\n"
+    "Ce que tu peux m'écrire :\n"
+    "commandes : la liste des commandes en cours\n"
+    "commande 12 : le détail de la commande n°12\n"
+    "#3 suivi de ton message : je le transmets à la cliente n°3\n"
     "#3 ok : paiement vérifié, la commande est confirmée\n"
-    "#3 annule : commande annulée\n"
-    "#3 bot : le bot reprend la conversation\n"
+    "#3 annule : la commande est annulée\n"
+    "#3 bot : je reprends la conversation avec la cliente\n"
     "Tu peux aussi répondre directement (glisser) à un message de cliente."
 )
 
 
 def traiter_message_proprietaire(texte, id_message_cite):
     nb_debloques = vider_file_attente()
+    cle = normaliser(texte)
 
+    # ---- Détail d'une commande : "commande 12", "commande n°12" ----
+    detail = re.match(r"^\s*commande\s*(?:n\s*°?|no|numero|#)?\s*(\d+)\s*$", texte, re.I)
+    if detail:
+        commande = commande_par_id(detail.group(1))
+        if not commande:
+            envoyer_message_whatsapp(NUMERO_PROPRIETAIRE, f"Je ne trouve pas la commande n°{detail.group(1)}.")
+            return
+        ticket = obtenir_ticket(commande["numero_whatsapp"])
+        envoyer_message_whatsapp(
+            NUMERO_PROPRIETAIRE,
+            f"{construire_recapitulatif(commande)}\n\nCliente #{ticket} (+{commande['numero_whatsapp']})\n"
+            f"Statut : {LIBELLES_STATUT.get(commande['statut'], commande['statut'])}")
+        return
+
+    # ---- Retrouver la cliente concernée ----
     numero_client = None
-    with verrou:
-        if id_message_cite:
-            numero_client = messages_vers_proprio.get(id_message_cite)
+    if id_message_cite:
+        lignes = requete_sql("select numero_whatsapp from public.messages_proprio where id_message = %s",
+                             (id_message_cite,))
+        if lignes:
+            numero_client = lignes[0]["numero_whatsapp"]
     correspondance = re.match(r"^\s*#(\d+)\s*(.*)$", texte, re.S)
     if correspondance:
-        with verrou:
-            numero_client = tickets.get(int(correspondance.group(1)))
+        numero_client = numero_par_ticket(correspondance.group(1))
         texte = correspondance.group(2).strip()
+        cle = normaliser(texte)
+        if not numero_client:
+            envoyer_message_whatsapp(NUMERO_PROPRIETAIRE, f"Je ne trouve pas de cliente #{correspondance.group(1)}.")
+            return
 
+    # ---- Pas de cliente visée ----
     if not numero_client:
-        # "ok", "merci"... servent juste à garder la fenêtre de 24 h ouverte : pas de réponse
-        if nb_debloques == 0 and normaliser(texte) not in ("ok", "okay", "merci", "oui"):
+        if "commande" in cle:
+            envoyer_message_whatsapp(NUMERO_PROPRIETAIRE, liste_commandes_en_cours())
+        elif nb_debloques == 0 and cle not in ("ok", "okay", "merci", "oui"):
+            # "ok", "merci"... servent juste à garder la fenêtre de 24 h ouverte : pas de réponse
             envoyer_message_whatsapp(NUMERO_PROPRIETAIRE, AIDE_PROPRIETAIRE)
         return
 
-    ticket = obtenir_ticket(numero_client)
-    with verrou:
-        conv = obtenir_conversation(numero_client)
-    commande_cle = normaliser(texte)
+    with verrou_cliente(numero_client):
+        conv = charger_conversation(numero_client)
+        ticket = conv["ticket"]
 
-    # ---- Paiement vérifié ----
-    if commande_cle in ("ok", "valide", "confirme", "paye"):
-        commande = derniere_commande(numero_client)
-        if commande and commande["statut"] in ("paiement_a_verifier", "en_attente_paiement"):
-            changer_statut_commande(commande["id"], "payee")
-            diminuer_stock(commande["articles"])
-            message = (f"Paiement bien reçu, merci. Votre commande n°{commande['id']} est confirmée. "
-                       f"Livraison prévue {commande['jour_livraison']} à {commande['commune']}.")
-            envoyer_message_whatsapp(numero_client, message)
-            with verrou:
+        # ---- Paiement vérifié ----
+        if cle in ("ok", "valide", "confirme", "paye"):
+            commande = derniere_commande(numero_client)
+            if commande and commande["statut"] in ("paiement_a_verifier", "en_attente_paiement"):
+                changer_statut_commande(commande["id"], "payee")
+                diminuer_stock(commande["articles"])
+                message = (f"Paiement bien reçu, merci. Votre commande n°{commande['id']} est confirmée. "
+                           f"Livraison prévue {commande['jour_livraison']} à {commande['commune']}.")
+                envoyer_message_whatsapp(numero_client, message)
                 ajouter_historique(conv, "assistant", message)
                 conv["mode"] = "bot"
-            envoyer_message_whatsapp(NUMERO_PROPRIETAIRE,
-                                     f"Commande n°{commande['id']} confirmée, la cliente #{ticket} est prévenue. "
-                                     "Le bot reprend la conversation.")
+                sauver_conversation(conv)
+                envoyer_message_whatsapp(NUMERO_PROPRIETAIRE,
+                                         f"Commande n°{commande['id']} confirmée, la cliente #{ticket} est prévenue. "
+                                         "Je reprends la conversation avec elle.")
+                return
+            cle = "bot"  # pas de paiement en attente : on rend simplement la main au bot
+
+        # ---- Commande annulée ----
+        if cle in ("annule", "annuler"):
+            commande = derniere_commande(numero_client)
+            if commande and commande["statut"] not in ("payee", "annulee"):
+                changer_statut_commande(commande["id"], "annulee")
+                if commande["statut"] == "a_payer_livraison":
+                    remettre_stock(commande["articles"])  # le stock avait été retiré à la commande
+                envoyer_message_whatsapp(NUMERO_PROPRIETAIRE,
+                                         f"Commande n°{commande['id']} annulée. Écris #{ticket} suivi d'un message "
+                                         "si tu veux expliquer pourquoi à la cliente.")
+            else:
+                envoyer_message_whatsapp(NUMERO_PROPRIETAIRE, f"Aucune commande à annuler pour #{ticket}.")
             return
-        commande_cle = "bot"  # pas de paiement en attente : on rend simplement la main au bot
 
-    # ---- Commande annulée ----
-    if commande_cle in ("annule", "annuler"):
-        commande = derniere_commande(numero_client)
-        if commande and commande["statut"] not in ("payee", "annulee"):
-            changer_statut_commande(commande["id"], "annulee")
-            if commande["statut"] == "a_payer_livraison":
-                remettre_stock(commande["articles"])  # le stock avait été retiré à la commande
-            envoyer_message_whatsapp(NUMERO_PROPRIETAIRE,
-                                     f"Commande n°{commande['id']} annulée. Écris #{ticket} suivi d'un message "
-                                     "si tu veux expliquer pourquoi à la cliente.")
-        else:
-            envoyer_message_whatsapp(NUMERO_PROPRIETAIRE, f"Aucune commande à annuler pour #{ticket}.")
-        return
-
-    # ---- Rendre la main au bot ----
-    if commande_cle in ("bot", "fin"):
-        with verrou:
+        # ---- Rendre la main au bot ----
+        if cle in ("bot", "fin"):
             conv["mode"] = "bot"
-        envoyer_message_whatsapp(NUMERO_PROPRIETAIRE, f"C'est noté, le bot reprend la conversation #{ticket}.")
-        return
+            sauver_conversation(conv)
+            envoyer_message_whatsapp(NUMERO_PROPRIETAIRE, f"C'est noté, je reprends la conversation #{ticket}.")
+            return
 
-    if not texte:
-        return
+        if not texte:
+            return
 
-    # ---- Message à transmettre à la cliente ----
-    with verrou:
+        # ---- Message à transmettre à la cliente ----
         conv["mode"] = "humain"
-        historique = list(conv["historique"])
-    try:
-        message = nettoyer_texte(reformuler_consigne(texte, historique))
-    except Exception as e:
-        print(f"Erreur reformulation : {e}")
-        message = nettoyer_texte(texte)
+        try:
+            message = nettoyer_texte(reformuler_consigne(texte, conv["historique"]))
+        except Exception as e:
+            print(f"Erreur reformulation : {e}")
+            message = nettoyer_texte(texte)
 
-    ok, _ = envoyer_message_whatsapp(numero_client, message)
-    if ok:
-        with verrou:
+        ok, _ = envoyer_message_whatsapp(numero_client, message)
+        if ok:
             ajouter_historique(conv, "assistant", message)
-        envoyer_message_whatsapp(NUMERO_PROPRIETAIRE, f"Envoyé à #{ticket} : {message}")
-    else:
-        envoyer_message_whatsapp(NUMERO_PROPRIETAIRE,
-                                 f"Impossible d'écrire à #{ticket} : elle n'a pas écrit depuis plus de 24 h.")
+            envoyer_message_whatsapp(NUMERO_PROPRIETAIRE, f"Envoyé à #{ticket} : {message}")
+        else:
+            envoyer_message_whatsapp(NUMERO_PROPRIETAIRE,
+                                     f"Impossible d'écrire à #{ticket} : elle n'a pas écrit depuis plus de 24 h.")
+        sauver_conversation(conv)
 
 
 # ============================================
 # MESSAGES DES CLIENTES
 # ============================================
 def traiter_message_client(numero, texte):
-    with verrou:
-        conv = obtenir_conversation(numero)
-        conv["derniere_activite"] = datetime.now()
+    with verrou_cliente(numero):
+        conv = charger_conversation(numero)
         ajouter_historique(conv, "user", texte)
-        mode = conv["mode"]
-        historique = list(conv["historique"])
+        sauver_conversation(conv, activite=True)
 
-    # Une conseillère a la main : on lui transmet le message, le bot se tait
-    if mode == "humain":
-        ticket = obtenir_ticket(numero)
-        envoyer_au_proprio(f"#{ticket} (+{numero}) : {texte}", numero)
-        return
+        # Une conseillère a la main : on lui transmet le message, le bot se tait
+        if conv["mode"] == "humain":
+            envoyer_au_proprio(f"#{conv['ticket']} (+{numero}) : {texte}", numero)
+            return
 
-    def envoyer_photo(url, legende):
-        ok, _ = envoyer_image_whatsapp(numero, url, legende)
-        return ok
+        def envoyer_photo(url, legende):
+            ok, _ = envoyer_image_whatsapp(numero, url, legende)
+            return ok
 
-    def envoyer_texte(message):
-        envoyer_message_whatsapp(numero, message)
-        with verrou:
+        def envoyer_texte(message):
+            envoyer_message_whatsapp(numero, message)
             ajouter_historique(conv, "assistant", message)
 
-    ctx = {"numero": numero, "photos": 0, "passer_la_main": None,
-           "envoyer_photo": envoyer_photo, "envoyer_texte": envoyer_texte}
+        ctx = {"numero": numero, "photos": 0, "passer_la_main": None,
+               "envoyer_photo": envoyer_photo, "envoyer_texte": envoyer_texte}
 
-    try:
-        reponse = nettoyer_texte(generer_reponse_claude(historique, ctx, OUTILS_WHATSAPP))
-    except Exception as e:
-        print(f"Erreur Claude : {e}")
-        reponse = "Désolée, petit souci technique. Une conseillère va vous recontacter très vite."
-        ctx["passer_la_main"] = "Erreur technique du bot"
+        try:
+            reponse = nettoyer_texte(generer_reponse_claude(list(conv["historique"]), ctx, OUTILS_WHATSAPP))
+        except Exception as e:
+            print(f"Erreur Claude : {e}")
+            reponse = "Désolée, petit souci technique. Une conseillère va vous recontacter très vite."
+            ctx["passer_la_main"] = "Erreur technique du bot"
 
-    if reponse:
-        envoyer_message_whatsapp(numero, reponse)
-        with verrou:
+        if reponse:
+            envoyer_message_whatsapp(numero, reponse)
             ajouter_historique(conv, "assistant", reponse)
+        sauver_conversation(conv)
 
-    if ctx["passer_la_main"]:
-        passer_la_main(numero, ctx["passer_la_main"], prevenir_client=False)
+        if ctx["passer_la_main"]:
+            passer_la_main(conv, ctx["passer_la_main"], prevenir_client=False)
 
 
 def traiter_media_client(numero, type_media, media):
     """La cliente envoie une image ou un document : capture de paiement, ou autre chose."""
-    ticket = obtenir_ticket(numero)
-    with verrou:
-        conv = obtenir_conversation(numero)
-        conv["derniere_activite"] = datetime.now()
+    with verrou_cliente(numero):
+        conv = charger_conversation(numero)
+        ticket = conv["ticket"]
         ajouter_historique(conv, "user", "(La cliente a envoyé une image)")
         conv["mode"] = "humain"
 
-    commande = None
-    try:
-        commande = derniere_commande(numero)
-    except Exception as e:
-        print(f"Erreur lecture commande : {e}")
+        commande = None
+        try:
+            commande = derniere_commande(numero)
+        except Exception as e:
+            print(f"Erreur lecture commande : {e}")
 
-    if commande and commande["statut"] == "en_attente_paiement":
-        changer_statut_commande(commande["id"], "paiement_a_verifier")
-        message_cliente = "Merci, nous avons bien reçu votre capture. Nous vérifions le paiement et revenons vers vous très vite."
-        legende = (f"Paiement commande n°{commande['id']} - cliente #{ticket} (+{numero})\n"
-                   f"Total attendu : {formater_prix(commande['total'])}\n"
-                   f"Si le paiement est bon : #{ticket} ok\n"
-                   f"Sinon : #{ticket} suivi de ton message")
-    else:
-        message_cliente = "Merci, je transmets votre image à une conseillère, elle vous répond très vite."
-        legende = (f"Image reçue de la cliente #{ticket} (+{numero})\n"
-                   f"Pour lui répondre : #{ticket} suivi de ton message\n"
-                   f"Pour rendre la main au bot : #{ticket} bot")
+        if commande and commande["statut"] == "en_attente_paiement":
+            changer_statut_commande(commande["id"], "paiement_a_verifier")
+            message_cliente = ("Merci, nous avons bien reçu votre capture. "
+                               "Nous vérifions le paiement et revenons vers vous très vite.")
+            legende = (f"Paiement commande n°{commande['id']} - cliente #{ticket} (+{numero})\n"
+                       f"Total attendu : {formater_prix(commande['total'])}\n"
+                       f"Si le paiement est bon : #{ticket} ok\n"
+                       f"Sinon : #{ticket} suivi de ton message")
+        else:
+            message_cliente = "Merci, je transmets votre image à une conseillère, elle vous répond très vite."
+            legende = (f"Image reçue de la cliente #{ticket} (+{numero})\n"
+                       f"Pour lui répondre : #{ticket} suivi de ton message\n"
+                       f"Pour rendre la main au bot : #{ticket} bot")
 
-    envoyer_message_whatsapp(numero, message_cliente)
-    with verrou:
+        envoyer_message_whatsapp(numero, message_cliente)
         ajouter_historique(conv, "assistant", message_cliente)
+        sauver_conversation(conv, activite=True)
 
     nom_fichier = media.get("filename") or ("capture.jpg" if type_media == "image" else "document")
     try:
@@ -844,7 +918,7 @@ def traiter_message_entrant(message):
 # ============================================
 @app.route("/")
 def home():
-    return "Le serveur du chatbot Chez Ella est en ligne !"
+    return "Le serveur du chatbot Chez Ella est en ligne ! (version 4)"
 
 
 @app.route("/message", methods=["POST"])
@@ -882,6 +956,10 @@ def verifier_webhook():
     return "Erreur de vérification", 403
 
 
+messages_traites = set()   # anti-doublon : Meta renvoie parfois le même message
+_verrou_doublons = threading.Lock()
+
+
 @app.route("/webhook", methods=["POST"])
 def recevoir_message_whatsapp():
     """
@@ -894,7 +972,7 @@ def recevoir_message_whatsapp():
             for change in entry.get("changes", []):
                 for message in change.get("value", {}).get("messages", []) or []:
                     id_message = message.get("id")
-                    with verrou:
+                    with _verrou_doublons:
                         if id_message in messages_traites:
                             continue
                         messages_traites.add(id_message)
